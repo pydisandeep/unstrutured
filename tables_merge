@@ -1,0 +1,151 @@
+from unstructured.partition.pdf import partition_pdf
+from bs4 import BeautifulSoup
+import pandas as pd
+import re
+from difflib import SequenceMatcher
+
+# -------- utilities
+def _norm_text(t: str) -> str:
+    t = re.sub(r'\s+', ' ', (t or '')).strip().lower()
+    t = re.sub(r'[:·•–—-]+', '', t)
+    return t
+
+def _header_tuple_from_html(html: str):
+    soup = BeautifulSoup(html or "", "html.parser")
+    thead = soup.select_one("thead")
+    if thead:
+        cells = thead.select("th, td")
+    else:
+        # fallback = first row as header when no thead
+        first = soup.select_one("tr")
+        cells = first.select("th, td") if first else []
+    return tuple(_norm_text(c.get_text(" ", strip=True)) for c in cells)
+
+def _similar(a, b, thresh=0.85):
+    if not a and not b:
+        return True
+    if not a or not b:
+        return False
+    A = " | ".join(a); B = " | ".join(b)
+    return SequenceMatcher(None, A, B).ratio() >= thresh
+
+def _bbox_from_coords(coords):
+    # Unstructured coordinates: Polygon -> use min/max
+    try:
+        pts = coords.points
+        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+        return (min(xs), min(ys), max(xs), max(ys))
+    except Exception:
+        return (None, None, None, None)
+
+def _xband(bbox):  # left/right band for alignment checks
+    x1, _, x2, _ = bbox
+    return (x1, x2)
+
+def _x_aligned(band_a, band_b, tol=20):
+    a1, a2 = band_a; b1, b2 = band_b
+    if None in (a1, a2, b1, b2):
+        return True  # if coords missing, don't block merge
+    return abs(a1 - b1) <= tol and abs(a2 - b2) <= tol
+
+def _row_htmls(html):
+    soup = BeautifulSoup(html or "", "html.parser")
+    # drop headers that repeat on each page
+    for tag in soup.select("thead"):
+        tag.decompose()
+    return [str(tr) for tr in soup.select("tbody tr") or soup.select("tr")]
+
+# -------- main stitcher
+def stitch_tables_from_pdf(pdf_path: str):
+    elements = partition_pdf(
+        filename=pdf_path,
+        strategy="hi_res",
+        skip_infer_table_types=False,
+        extract_images_in_pdf=False,
+    )
+
+    # 1) order elements
+    def sort_key(e):
+        m = e.metadata
+        bbox = _bbox_from_coords(getattr(m, "coordinates", None))
+        x = bbox[0] if bbox[0] is not None else 9e9
+        y = bbox[1] if bbox[1] is not None else 9e9
+        return (m.page_number or 9e9, y, x)
+
+    elements = sorted(elements, key=sort_key)
+
+    # 2) collect table blocks
+    tables = []
+    for e in elements:
+        if getattr(e, "category", None) == "Table":
+            meta = e.metadata
+            html = getattr(meta, "text_as_html", None) or getattr(e, "text", None) or ""
+            header = _header_tuple_from_html(html)
+            bbox = _bbox_from_coords(getattr(meta, "coordinates", None))
+            col_count = 0
+            soup = BeautifulSoup(html or "", "html.parser")
+            first_row = soup.select_one("tr")
+            if first_row:
+                col_count = len(first_row.select("th, td"))
+            tables.append({
+                "page": meta.page_number,
+                "bbox": bbox,
+                "xband": _xband(bbox),
+                "header": header,
+                "cols": col_count,
+                "rows": _row_htmls(html),
+                "html": html,  # keep original
+            })
+
+    # 3) stitch by heuristics
+    stitched = []
+    for t in tables:
+        attached = False
+        for group in reversed(stitched):
+            # same header (or very similar), same col count, x-aligned, consecutive page
+            cond = (
+                _similar(t["header"], group["header"]) and
+                t["cols"] == group["cols"] and
+                _x_aligned(t["xband"], group["xband"]) and
+                (t["page"] == group["last_page"] or t["page"] == group["last_page"] + 1)
+            )
+            if cond:
+                group["rows"].extend(t["rows"])
+                group["last_page"] = max(group["last_page"], t["page"])
+                attached = True
+                break
+        if not attached:
+            stitched.append({
+                "header": t["header"],
+                "cols": t["cols"],
+                "xband": t["xband"],
+                "rows": list(t["rows"]),
+                "first_page": t["page"],
+                "last_page": t["page"],
+            })
+
+    # 4) build final HTML & DataFrames
+    results = []
+    for i, g in enumerate(stitched, 1):
+        # rebuild a clean table HTML
+        thead = "".join(f"<th>{h}</th>" for h in g["header"]) if g["header"] else ""
+        thead = f"<thead><tr>{thead}</tr></thead>" if thead else ""
+        tbody = "<tbody>" + "".join(g["rows"]) + "</tbody>"
+        html = f"<table>{thead}{tbody}</table>"
+        try:
+            df = pd.read_html(html)[0]  # pandas parses the first table
+        except Exception:
+            df = pd.DataFrame()
+        results.append({
+            "table_id": f"table_{i}",
+            "pages": (g["first_page"], g["last_page"]),
+            "html": html,
+            "dataframe": df,
+        })
+    return results
+
+# -------- usage
+# stitched = stitch_tables_from_pdf("report.pdf")
+# for t in stitched:
+#     print(t["table_id"], "pages:", t["pages"], "shape:", t["dataframe"].shape)
+#     # t["html"] is a single, merged table; t["dataframe"] is ready for CSV/SQL
