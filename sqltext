@@ -1,0 +1,181 @@
+perfect — let’s reset and go end-to-end, but in a practical, compact way.
+You want a system that can answer regulatory data questions from SQL across multiple tables, without a naïve “text-to-SQL” guesser.
+Here’s how that full flow works, from question to validated answer.
+
+🧩 Step 0 — Input
+
+A user (you, a QA reviewer, or a regulator) asks a question like:
+
+“How many serious adverse events were reported for Product X in the EMA region since August 2025?”
+
+We want to translate this into a safe, auditable SQL query that pulls from several tables (fct_adverse_event, dim_product, dim_site, etc.) and gives a validated result.
+
+1️⃣ Semantic layer — “what things mean”
+
+Goal: Make business terms machine-readable before touching SQL.
+
+You define three small YAML/JSON files:
+
+Glossary → defines entities (product, site, AE, CAPA, submission), their keys, and normalized values.
+
+Metrics → defines reusable metrics (e.g., “serious_adverse_events = count where seriousness='SERIOUS'”).
+
+Lexicon → maps natural phrases to metrics/filters (“EMA” → regulator_code=‘EMA’; “last month” → date range).
+
+{
+  "metric": "serious_adverse_events",
+  "filters": [
+    {"field": "product_name", "value": "Product X"},
+    {"field": "regulator_code", "value": "EMA"},
+    {"field": "onset_date", "op": ">=", "value": "2025-08-01"}
+  ]
+}
+
+
+
+
+fct_adverse_event:
+  joins:
+    - target: dim_product
+      on: product_id
+      scd_current_only: true
+    - target: dim_site
+      on: site_id
+      optional: true
+
+
+
+
+2️⃣ Schema graph — “how tables connect”
+
+Goal: Know the only allowed ways to join data.
+
+You encode the data model as a graph (tables = nodes, joins = edges) with metadata:
+
+fct_adverse_event:
+  joins:
+    - target: dim_product
+      on: product_id
+      scd_current_only: true
+    - target: dim_site
+      on: site_id
+      optional: true
+
+
+This graph tells the planner:
+
+Which joins are legal
+
+Their type (1-to-many, SCD rules, etc.)
+
+What paths are forbidden (to avoid duplication or leakage)
+
+3️⃣ Question understanding — “what type of query”
+
+Use a lightweight NLP/classifier (not an LLM that writes SQL) to decide:
+
+Component	Example
+Intent	count / list / trend / average
+Metric	serious_adverse_events
+Filters	product='X', regulator='EMA', onset_date >= '2025-08-01'
+Group by	none
+
+🟢 Output: A query plan request object like
+
+{
+  "intent": "count",
+  "metric": "serious_adverse_events",
+  "grain": "event",
+  "filters": [...],
+  "group_by": []
+}
+
+
+
+
+
+4️⃣ SQL planner — “build the query safely”
+
+Goal: Use templates + schema graph to synthesize deterministic SQL.
+
+Template (for count metrics):
+
+SELECT COUNT(DISTINCT ae.event_id) AS serious_adverse_events
+FROM fct_adverse_event ae
+JOIN dim_product p
+  ON ae.product_id = p.product_id
+ AND p.is_current = TRUE
+WHERE UPPER(ae.seriousness) = 'SERIOUS'
+  AND p.regulator_code = 'EMA'
+  AND p.product_name = 'Product X'
+  AND ae.onset_date >= '2025-08-01';
+
+
+✅ Uses only allowed tables and join paths.
+✅ Applies metric logic from the semantic layer.
+✅ Automatically injects SCD2 and privacy filters.
+
+5️⃣ Validation & execution — “prove it’s safe and correct”
+
+Before executing:
+
+Dry run – verify all columns/tables exist.
+
+Cardinality checks – ensure join fan-out < policy limit (e.g., 5× base).
+
+Business assertions – e.g., serious_AE_count ≤ total_AE_count.
+
+Privacy check – block PII columns unless explicitly allowed.
+
+If validation passes → run SQL in the data warehouse.
+
+🟢 Output example
+
+{
+  "serious_adverse_events": 127,
+  "provenance": {
+    "tables": ["fct_adverse_event","dim_product"],
+    "joins": ["product_id"],
+    "filters": ["regulator_code='EMA'", "product_name='Product X'", "onset_date >= '2025-08-01'"],
+    "sql_hash": "abc123..."
+  }
+}
+
+6️⃣ Packaging for regulators — “show your work”
+
+Bundle everything used:
+
+The generated SQL
+
+Input question and resolved structure
+
+Metric definition version
+
+Table versions / schema snapshot
+
+Row counts before and after joins
+
+Validation report
+
+This produces an ALCOA+ compliant audit trail (“attributable, legible, contemporaneous, original, accurate”).
+
+7️⃣ Continuous improvement
+
+Maintain:
+
+Golden set of Q→SQL→Result examples.
+
+Drift monitor for schema or enum changes.
+
+Feedback capture (“wrong metric”, “join missing”) → updates YAMLs, not code.
+
+🎯 Summary — the full lifecycle
+Step	What it does	Output
+1	Semantic layer	Business meanings
+2	Schema graph	Allowed join map
+3	Question parser	Structured intent
+4	SQL planner	Safe query
+5	Validator	Checked + executed result
+6	Packager	Audit artifact
+7	Feedback	Improved semantics & joins
+
