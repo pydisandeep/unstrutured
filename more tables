@@ -1,0 +1,364 @@
+totally—when you have many tables, the smartest path is: auto-harvest rich metadata first, then build the semantic layer from that source of truth, not by hand. Here’s a concrete, scale-friendly plan that you can implement incrementally.
+Phase 0 — Bootstrapping the metadata cache (single source of truth)
+Create a lightweight “catalog” schema in your warehouse (or a small Postgres/SQLite sidecar) to store everything you learn about the data.
+0.1 Tables in the metadata cache
+
+
+catalog.tables — one row per table/view (db, schema, name, row_count, last_modified, owner, description)
+
+
+catalog.columns — one row per column (table_id, name, data_type, nullable, distinct_count, null_pct, min/max, example_values)
+
+
+catalog.keys — primary keys + unique keys detected or declared (table_id, column_set, confidence)
+
+
+catalog.fks — foreign key candidates (src_table, src_cols, tgt_table, tgt_cols, evidence, confidence)
+
+
+catalog.scd_profiles — SCD patterns (type, start_col, end_col, current_flag, confidence)
+
+
+catalog.enums — stable low-cardinality code sets (table.col, value, label?, frequency)
+
+
+catalog.privacy_tags — PII/PHI classification (table.col, tag, evidence, policy)
+
+
+catalog.usage — optional: query logs (table/column usage frequency) for prioritization
+
+
+0.2 How to populate it (automated jobs)
+
+
+Schema crawl (INFORMATION_SCHEMA / catalog tables)
+
+
+Works on Snowflake/Redshift/BigQuery/Postgres. Grab tables, columns, data types, comments.
+
+
+
+
+Profiling (sample + full stats where cheap)
+
+
+distinct counts (approx if supported), null %, min/max, frequent values (top-K).
+
+
+
+
+Key discovery
+
+
+Find candidate primary keys via uniqueness tests on 1–3 column combos for fact-like tables.
+
+
+
+
+FK discovery
+
+
+For each candidate key, test coverage from child tables (referential coverage %, name heuristics: *_id).
+
+
+
+
+SCD detection
+
+
+Patterns: (start,end) timestamps, is_current flag, or overlapping date intervals per business key.
+
+
+
+
+Enum harvesting
+
+
+Low-card columns (e.g., < 200 distinct) → capture values/frequencies and any existing descriptions.
+
+
+
+
+Privacy tagging
+
+
+Regex + dictionary + model assist (e.g., column names like dob, ssn, phone, email, mrn, address, birth_date, patient_*; value pattern checks). Mark as pii_direct, pii_indirect, phi, or safe.
+
+
+
+
+Usage signals (optional)
+
+
+Pull from warehouse query history to rank “hot” tables/columns.
+
+
+
+
+
+Run the crawler nightly; store a snapshot version so you can diff changes and trigger semantic updates.
+
+
+Phase 1 — Generate the first semantic layer from metadata (semi-auto)
+Use the metadata cache to propose entities, dimensions, facts, and join policies. You curate, not author from scratch.
+1.1 Entity & fact identification (rules of thumb)
+
+
+Entities/dimensions: tables with stable keys (unique/PK confidence high), many inbound FKs, slowly changing profile → dim_* or “entity”.
+
+
+Facts: tables with high row counts, many outbound FKs, date grains, event-like columns → fct_*.
+
+
+
+Produce a draft semantics/glossary.yml where each table is typed: entity|fact|bridge, with keys, and any SCD fields found.
+
+1.2 Join graph (policy, not just detection)
+
+
+Build semantics/schema_graph.yml from catalog.fks but gate it:
+
+
+Only include edges with coverage ≥ e.g., 90% and name match (product_id → product_id).
+
+
+Flag ambiguous multi-hop joins and require human approval.
+
+
+Annotate edges with cardinality and scd_current_only derived from catalog.scd_profiles.
+
+
+
+
+1.3 Code sets & enums
+
+
+From catalog.enums, create semantics/enums.yml with value lists + optional labels (e.g., MedDRA mappings if present).
+
+
+Add normalization (uppercase, trimming) rules and synonym bridges (EMA ↔ EU).
+
+
+1.4 Privacy policy
+
+
+From catalog.privacy_tags, generate semantics/privacy.yml:
+
+
+allowlist_listing_cols for non-PII dimensions
+
+
+blocked_listing_cols for PII/PHI
+
+
+Aggregation-only rules (e.g., subject.country only at ≥ N threshold).
+
+
+
+
+1.5 Metric seeds
+
+
+Auto-suggest metric candidates where patterns exist:
+
+
+count_* on fact tables filtered by enums (seriousness='SERIOUS')
+
+
+date-diff metrics where both start/end dates exist (cycle_time_days)
+
+
+
+
+Emit a draft semantics/metrics.yml marked draft: true for human review.
+
+
+
+Phase 2 — Human-in-the-loop curation (fast reviews)
+
+
+Review auto-suggested entities/joins in PRs. Keep changes small and frequent.
+
+
+Confirm SCD columns and set enterprise defaults (e.g., is_current=TRUE policy).
+
+
+Approve a starter set of 10–20 metrics that cover 80% of regulatory questions.
+
+
+
+Phase 3 — Deterministic planner + guardrails
+
+
+Use intent templates (count/list/trend/agg) that reference only approved paths/metrics.
+
+
+Guardrails read from semantics + privacy:
+
+
+block unapproved joins, enforce is_current, apply enum normalization, impose date windows, fan-out limits.
+
+
+
+
+
+What this looks like in practice (snippets)
+A) Warehouse-agnostic crawl queries (illustrative)
+Tables & columns (Snowflake-ish)
+-- tables
+SELECT table_catalog, table_schema, table_name, row_count, comment
+FROM INFORMATION_SCHEMA.TABLES
+WHERE table_schema NOT IN ('INFORMATION_SCHEMA');
+
+-- columns
+SELECT table_catalog, table_schema, table_name, column_name, data_type, is_nullable, comment
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE table_schema NOT IN ('INFORMATION_SCHEMA');
+
+Stat sampling (approx distinct + examples)
+-- per column sample
+SELECT
+  ANY_VALUE(col_name) AS col,
+  COUNT(*) AS n,
+  COUNT_IF(col IS NULL) / COUNT(*)::float AS null_pct,
+  APPROX_COUNT_DISTINCT(col) AS approx_ndv,
+  MIN(col) AS min_v, MAX(col) AS max_v
+FROM your_table
+SAMPLE (1) -- or TABLESAMPLE for BQ
+
+FK coverage test (candidate: ae.product_id → product.product_id)
+WITH ae_keys AS (SELECT DISTINCT product_id FROM fct_adverse_event WHERE product_id IS NOT NULL),
+prod_keys AS (SELECT DISTINCT product_id FROM dim_product WHERE is_current = TRUE)
+SELECT
+  (SELECT COUNT(*) FROM ae_keys) AS child_keys,
+  (SELECT COUNT(*) FROM ae_keys a LEFT JOIN prod_keys p ON a.product_id = p.product_id WHERE p.product_id IS NOT NULL) AS matched_keys;
+
+Compute coverage = matched_keys / child_keys. Store as evidence.
+B) Metadata → join policy (auto-emitted YAML)
+# semantics/schema_graph.yml (generated)
+version: 1
+tables:
+  fct_adverse_event:
+    keys: [event_id]
+    scd: null
+    joins:
+      - target: dim_product
+        on: [product_id = product_id]
+        cardinality: M:1
+        scd_current_only: true
+        confidence: 0.97
+      - target: dim_subject
+        on: [subject_id = subject_id]
+        cardinality: M:1
+        scd_current_only: true
+        confidence: 0.94
+  dim_product:
+    keys: [product_id]
+    scd:
+      type: SCD2
+      current_flag_col: is_current
+
+C) Enum harvesting → normalization
+# semantics/enums.yml
+regulator_code:
+  values: [EMA, FDA, MHRA, PMDA]
+  normalization: uppercase
+seriousness:
+  values: [SERIOUS, NON_SERIOUS]
+  synonyms:
+    Serious: SERIOUS
+    serious: SERIOUS
+
+D) Privacy policy (from scans)
+# semantics/privacy.yml
+allowlist_listing_cols:
+  - product.product_name
+  - site.region
+blocked_listing_cols:
+  - subject.birth_date
+  - subject.email
+aggregation_only:
+  - subject.country
+k_anonymity: 10
+
+E) Metric seed (auto-suggested; you approve)
+# semantics/metrics.yml
+metrics:
+  serious_adverse_events:
+    entity: adverse_event
+    grain: event_id
+    where: [{field: seriousness, op: '=', value: 'SERIOUS'}]
+    valid_filters: [product_id, regulator_code, onset_date]
+    status: approved
+  submission_cycle_time_days:
+    entity: submission
+    expression: "DATE_DIFF('day', submission_date, decision_date)"
+    aggregation: avg
+    constraints: ["decision_date IS NOT NULL"]
+    valid_filters: [product_id, regulator_code, submission_type, submission_date]
+    status: draft
+
+
+Prioritization (so you don’t boil the ocean)
+When there are hundreds of tables:
+
+
+Score tables: priority = usage_weight*usage + fk_weight*inbound_fks + row_weight*row_count + freshness_weight*recency.
+
+
+Start with the top 20; expect they cover 80% of regulatory questions.
+
+
+Lock semantics/joins for those; expand outward each sprint.
+
+
+
+Drift & governance
+
+
+Nightly crawler diffs schema/enums; open an automatic PR when:
+
+
+a new enum value appears (e.g., new seriousness code),
+
+
+a join coverage drops (potential data issue),
+
+
+SCD flags change.
+
+
+
+
+Keep everything versioned. Each answered question records:
+
+
+semantic versions (glossary/metrics/privacy),
+
+
+schema graph version,
+
+
+catalog snapshot id.
+
+
+
+
+
+Why this works well
+
+
+Scales to many tables: you curate only deltas, not author from scratch.
+
+
+Safe by construction: planner can only use approved edges/metrics.
+
+
+Auditable: every answer cites semantic + graph versions and the exact SQL.
+
+
+Fast onboarding: new domains get bootstrapped from the crawler outputs.
+
+
+
+If you tell me your warehouse (Snowflake/Redshift/BigQuery/Postgres) I can tailor the crawler SQL and the metadata table DDL to your environment—and generate a minimal starter repo layout you can drop into place.
