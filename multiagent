@@ -1,0 +1,131 @@
+from typing import Dict, List, Any, Callable, Optional
+from pydantic import BaseModel
+import json
+
+# --- Shared models ---
+class Message(BaseModel):
+    sender: str
+    payload: Any
+    targets: List[str]              # list of agent names to deliver to
+    meta: Optional[Dict[str, Any]] = None
+
+class MultiAgentState(BaseModel):
+    inboxes: Dict[str, List[Message]] = {}     # agent_name -> messages
+    agents: Dict[str, str] = {}                # agent_name -> node id (or metadata)
+    allowed_targets: Dict[str, List[str]] = {} # optional ACL: who each agent may message
+    logs: List[str] = []
+    stop_flag: bool = False
+    # any extra shared keys you want
+
+# --- Utilities ---
+def log(state: MultiAgentState, text: str):
+    state.logs.append(text)
+
+def deliver_message(state: MultiAgentState, msg: Message):
+    """Place message in each target inbox, honoring allowed_targets if present."""
+    for t in msg.targets:
+        # enforce ACL if defined
+        allowed = state.allowed_targets.get(msg.sender)
+        if allowed is not None and t not in allowed:
+            log(state, f"DELIVERY BLOCKED: {msg.sender} -> {t}")
+            continue
+        if t not in state.inboxes:
+            state.inboxes[t] = []
+        state.inboxes[t].append(msg)
+        log(state, f"DELIVERED: {msg.sender} -> {t} payload={msg.payload}")
+
+# --- Example agent node factories (each returns a callable that accepts state & agent_name) ---
+def make_echo_agent(name: str) -> Callable[[MultiAgentState, str], Dict]:
+    def node(state: MultiAgentState, agent_name: str):
+        inbox = state.inboxes.get(agent_name, [])
+        if not inbox:
+            return {}
+        # Process all messages (could instead process one at a time)
+        for msg in inbox:
+            log(state, f"{agent_name} processing from {msg.sender}: {msg.payload}")
+            # Example behavior: echo payload to any target specified in payload (if dict)
+            if isinstance(msg.payload, dict) and 'forward_to' in msg.payload:
+                targets = msg.payload['forward_to']
+            else:
+                targets = []
+            # create outgoing message
+            out = Message(sender=agent_name, payload={"echo": msg.payload}, targets=targets)
+            deliver_message(state, out)
+        # clear inbox once consumed
+        state.inboxes[agent_name] = []
+        return {}
+    return node
+
+def make_transform_agent(name: str, transform_fn: Callable[[Any], Any], default_targets: List[str]=[]):
+    def node(state: MultiAgentState, agent_name: str):
+        inbox = state.inboxes.get(agent_name, [])
+        if not inbox:
+            return {}
+        for msg in inbox:
+            log(state, f"{agent_name} transforming from {msg.sender}: {msg.payload}")
+            new_payload = transform_fn(msg.payload)
+            out = Message(sender=agent_name, payload=new_payload, targets=msg.targets or default_targets)
+            deliver_message(state, out)
+        state.inboxes[agent_name] = []
+        return {}
+    return node
+
+# --- Dispatcher: drive execution until no inboxes === non-empty or stop_flag set ---
+def dispatcher(state: MultiAgentState, agent_runner_map: Dict[str, Callable[[MultiAgentState, str], Dict]]):
+    """
+    This node is the work loop. It finds agents with inboxes and invokes their node.
+    It returns when there's no work or state.stop_flag is True.
+    """
+    # Simple round-robin loop for demo; you can implement priority queues, concurrency, etc.
+    while not state.stop_flag:
+        # find an agent with non-empty inbox
+        ready_agents = [a for a, msgs in state.inboxes.items() if msgs]
+        if not ready_agents:
+            log(state, "Dispatcher: no ready agents, stopping.")
+            break
+        for agent_name in ready_agents:
+            node = agent_runner_map.get(agent_name)
+            if not node:
+                log(state, f"Dispatcher: no node for {agent_name}, dropping messages.")
+                # optionally clear or keep messages; here we drop
+                state.inboxes[agent_name] = []
+                continue
+            log(state, f"Dispatcher: invoking {agent_name} with {len(state.inboxes.get(agent_name,[]))} messages")
+            node(state, agent_name)
+            if state.stop_flag:
+                log(state, "Dispatcher: stop flag set; exiting.")
+                break
+    return {}
+
+# --- Build a small runtime & demo ---
+def build_and_run_demo():
+    # 1) create state
+    state = MultiAgentState()
+    # define agents
+    agent_names = ["A", "B", "C", "D", "Logger"]
+    for a in agent_names:
+        state.inboxes[a] = []
+    # optional ACL: allow any-to-any for full mesh
+    for a in agent_names:
+        state.allowed_targets[a] = agent_names.copy()  # full mesh
+    # 2) create node callables
+    nodes = {
+        "A": make_transform_agent("A", transform_fn=lambda p: {"fromA": p}, default_targets=["B","C"]),
+        "B": make_echo_agent("B"),
+        "C": make_transform_agent("C", transform_fn=lambda p: {"fromC": p}, default_targets=["D"]),
+        "D": make_echo_agent("D"),
+        "Logger": make_transform_agent("Logger", transform_fn=lambda p: {"logged": p}, default_targets=[])
+    }
+    # 3) seed messages into A's inbox (could be user input)
+    seed = Message(sender="system", payload={"text": "start", "forward_to": ["B","C"]}, targets=["A"])
+    deliver_message(state, seed)
+    # 4) run dispatcher
+    dispatcher(state, nodes)
+    # 5) show logs
+    print("\n".join(state.logs))
+    print("--- Final inboxes ---")
+    print({k: [m.dict() for m in v] for k, v in state.inboxes.items()})
+
+# Run demo
+if __name__ == "__main__":
+    build_and_run_demo()
